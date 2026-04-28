@@ -1,0 +1,185 @@
+name: Cloudflare Workers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-workers
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+      D1_DATABASE_NAME: ${{ secrets.CLOUDFLARE_D1_DATABASE_NAME }}
+      R2_BUCKET_NAME: ${{ secrets.CLOUDFLARE_R2_BUCKET_NAME }}
+      WEB_HOSTNAME: ${{ secrets.CLOUDFLARE_WEB_HOSTNAME }}
+      EMAIL_HOSTNAME: ${{ secrets.CLOUDFLARE_EMAIL_HOSTNAME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Validate required secrets
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || (echo "Missing CLOUDFLARE_ACCOUNT_ID" && exit 1)
+          test -n "$CLOUDFLARE_API_TOKEN" || (echo "Missing CLOUDFLARE_API_TOKEN" && exit 1)
+          test -n "$WEB_HOSTNAME" || (echo "Missing CLOUDFLARE_WEB_HOSTNAME" && exit 1)
+          test -n "$EMAIL_HOSTNAME" || (echo "Missing CLOUDFLARE_EMAIL_HOSTNAME" && exit 1)
+
+      - name: Verify Cloudflare API token
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(
+            "https://api.cloudflare.com/client/v4/user/tokens/verify",
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+              },
+            },
+          );
+          const body = await response.json();
+          if (!response.ok || body.success !== true)
+            throw new Error(
+              `CLOUDFLARE_API_TOKEN is not valid for Cloudflare API authentication: ${JSON.stringify(body.errors ?? body)}`,
+            );
+          NODE
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run Worker tests
+        run: npm run test:worker
+
+      - name: Prepare Wrangler config
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const path = "wrangler.jsonc";
+          const api = async (pathname, init) => {
+            const response = await fetch(
+              `https://api.cloudflare.com/client/v4${pathname}`,
+              {
+                ...init,
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+                  ...init?.headers,
+                },
+              },
+            );
+            const body = await response.json();
+            if (!response.ok || body.success !== true)
+              throw new Error(
+                JSON.stringify({
+                  status: response.status,
+                  errors: body.errors,
+                  messages: body.messages,
+                }),
+              );
+            return body.result;
+          };
+
+          const databaseName =
+            process.env.D1_DATABASE_NAME?.trim() || "kill-the-newsletter";
+          let databaseId = process.env.D1_DATABASE_ID?.trim();
+
+          if (!databaseId) {
+            const databases = await api(
+              `/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/d1/database?name=${encodeURIComponent(databaseName)}`,
+            );
+            databaseId = databases.find(
+              (database) => database.name === databaseName,
+            )?.uuid;
+          }
+
+          if (!databaseId) {
+            const database = await api(
+              `/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/d1/database`,
+              {
+                method: "POST",
+                body: JSON.stringify({ name: databaseName }),
+              },
+            );
+            databaseId = database.uuid;
+          }
+
+          if (!databaseId)
+            throw new Error(`Could not resolve D1 database ${databaseName}.`);
+
+          const values = {
+            databaseId,
+            databaseName,
+            emailHostname: process.env.EMAIL_HOSTNAME,
+            r2BucketName:
+              process.env.R2_BUCKET_NAME?.trim() ||
+              "kill-the-newsletter-files",
+            webHostname: process.env.WEB_HOSTNAME,
+          };
+
+          let config = fs.readFileSync(path, "utf8");
+          for (const [pattern, replacement] of [
+            [
+              /("WEB_HOSTNAME"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.webHostname)}`,
+            ],
+            [
+              /("EMAIL_HOSTNAME"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.emailHostname)}`,
+            ],
+            [
+              /("pattern"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.webHostname)}`,
+            ],
+            [
+              /("database_name"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.databaseName)}`,
+            ],
+            [
+              /("database_id"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.databaseId)}`,
+            ],
+            [
+              /("bucket_name"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(values.r2BucketName)}`,
+            ],
+          ]) {
+            if (!pattern.test(config))
+              throw new Error(`Could not update ${String(pattern)}.`);
+            config = config.replace(pattern, replacement);
+          }
+
+          if (config.includes("00000000-0000-0000-0000-000000000000"))
+            throw new Error("D1 database_id placeholder is still present.");
+          if (config.includes('"WEB_HOSTNAME": "newsletter.example.com"'))
+            throw new Error("WEB_HOSTNAME placeholder is still present.");
+          if (config.includes('"EMAIL_HOSTNAME": "example.com"'))
+            throw new Error("EMAIL_HOSTNAME placeholder is still present.");
+          if (config.includes('"pattern": "newsletter.example.com"'))
+            throw new Error("route pattern placeholder is still present.");
+
+          fs.writeFileSync(path, config);
+          NODE
+
+      - name: Bundle check
+        run: npx wrangler deploy --dry-run --outdir /tmp/kill-the-newsletter-worker-build
+
+      - name: Apply D1 migrations
+        run: |
+          D1_DATABASE_NAME="${D1_DATABASE_NAME:-kill-the-newsletter}"
+          npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote
+
+      - name: Deploy Worker
+        run: npx wrangler deploy

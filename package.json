@@ -3,15 +3,22 @@
     "prepare": "tsc && build",
     "start": "nodemon --watch ./package.json --watch ./tsconfig.json --watch ./source/ --watch ./static/ --watch ./configuration/ --ext \"*\" --exec \"npm run prepare && node ./build/index.mjs ./configuration/development.mjs\"",
     "test": "npm run prepare && prettier --check ./README.md ./CHANGELOG.md ./package.json ./tsconfig.json ./source/ ./configuration/",
+    "test:worker": "tsc && node --test build/worker.test.mjs",
+    "dev:worker": "wrangler dev",
+    "deploy:worker": "wrangler deploy",
+    "migrate:worker:local": "wrangler d1 migrations apply kill-the-newsletter --local",
+    "migrate:worker:remote": "wrangler d1 migrations apply kill-the-newsletter --remote",
     "backup": "rsync -av --delete --progress root@kill-the-newsletter.com:/mnt/kill-the-newsletter/kill-the-newsletter/data/ /Volumes/leafac--hd/backups/kill-the-newsletter/"
   },
   "dependencies": {
     "@radically-straightforward/production": "^1.0.63",
     "crypto-random-string": "^5.0.0",
     "mailparser": "^3.9.3",
+    "postal-mime": "^2.7.4",
     "smtp-server": "^3.18.1"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260413.1",
     "@fontsource-variable/roboto-flex": "^5.2.8",
     "@radically-straightforward/development": "^1.0.77",
     "@types/mailparser": "^3.4.6",
@@ -22,7 +29,8 @@
     "nodemailer": "^8.0.1",
     "nodemon": "^3.1.11",
     "prettier": "^3.8.1",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "wrangler": "^4.82.2"
   },
   "prettier": {}
 }
